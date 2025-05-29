@@ -1,6 +1,7 @@
 // app.js
 const express = require('express');
 const axios = require('axios');
+const cors = require('cors'); // Add this dependency
 const app = express();
 const snapsaveDownloader = require('./snapsave-downloader'); // The modified obfuscated downloader
 const { v4: uuidv4 } = require('uuid');
@@ -18,6 +19,43 @@ if (process.env.NODE_ENV === 'production' && process.env.PUBLIC_URL) {
 }
 console.log(`Using BASE_URL: ${BASE_URL}`);
 
+// CORS Configuration - Enable for all origins (adjust as needed for production)
+const corsOptions = {
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    
+    // Allow all origins for development/testing (modify for production)
+    callback(null, true);
+  },
+  credentials: true,
+  optionsSuccessStatus: 200, // Some legacy browsers choke on 204
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept']
+};
+
+app.use(cors(corsOptions));
+
+// Handle preflight requests for all routes
+app.options('*', cors(corsOptions));
+
+// Parse JSON bodies
+app.use(express.json());
+
+// Add additional CORS headers manually as backup
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  
+  // Handle preflight
+  if (req.method === 'OPTIONS') {
+    res.sendStatus(200);
+    return;
+  }
+  
+  next();
+});
 
 app.get('/', (req, res) => {
   res.json({
@@ -66,7 +104,6 @@ app.get('/api/data', async (req, res) => {
     postTitle = postTitle.substring(0, 50).replace(/[^\w\s.-_]/g, '').replace(/\s+/g, '_');
     if (!postTitle) postTitle = 'media';
 
-
     const responseMedia = [];
 
     if (!result.data || result.data.length === 0) {
@@ -98,7 +135,6 @@ app.get('/api/data', async (req, res) => {
         }
       }
 
-
       // Filename: VibeDownloader.me - {title}.ext
       const filename = `VibeDownloader.me - ${postTitle}.${extension}`;
 
@@ -117,7 +153,6 @@ app.get('/api/data', async (req, res) => {
         type: mediaType,
         quality: qualityString || 'Standard',
         url: item.url, // Provide the direct URL as well
-        download_api_url: `${BASE_URL}/api/media/stream/${mediaId}`, // Direct download stream link
         thumbnail: item.thumbnail || null,
       });
     }
@@ -155,51 +190,119 @@ app.get('/api/media/stream/:id', async (req, res) => {
         .replace(/\)/g, '%29')
         .replace(/\*/g, '%2A');
 
-
-    const response = await axios({
+    console.log(`Streaming media from URL: ${mediaInfo.actualUrl}`);
+    
+    // Enhanced axios configuration for better reliability
+    const axiosConfig = {
       method: 'get',
       url: mediaInfo.actualUrl,
       responseType: 'stream',
-      headers: { // Mimic a browser User-Agent
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'Referer': 'https://www.instagram.com/' // Common referer
+      timeout: 30000, // 30 second timeout
+      maxRedirects: 5,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'cross-site',
+        'Referer': 'https://www.instagram.com/',
+        'Origin': 'https://www.instagram.com'
+      },
+      validateStatus: function (status) {
+        return status >= 200 && status < 400; // Accept 2xx and 3xx status codes
       }
-    });
+    };
+
+    const response = await axios(axiosConfig);
     
     // Check for redirect and get final URL if needed (some CDNs might redirect)
-    if (response.request.res.responseUrl && response.request.res.responseUrl !== mediaInfo.actualUrl) {
+    if (response.request.res && response.request.res.responseUrl && response.request.res.responseUrl !== mediaInfo.actualUrl) {
         console.log(`Redirected from ${mediaInfo.actualUrl} to ${response.request.res.responseUrl}`);
     }
 
+    // Set proper headers for download
     res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
     res.setHeader('Content-Type', mediaInfo.contentType);
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition');
+    
     if (response.headers['content-length']) {
         res.setHeader('Content-Length', response.headers['content-length']);
     }
     
+    // Handle stream errors
     response.data.on('error', (streamError) => {
         console.error('Error streaming media from source URL:', mediaInfo.actualUrl, streamError);
         if (!res.headersSent) {
-            res.status(502).send("Error streaming media from the source.");
+            res.status(502).json({ error: "Error streaming media from the source." });
+        } else {
+            res.destroy();
         }
-        res.end();
     });
     
+    // Handle response end
+    response.data.on('end', () => {
+        console.log(`Successfully streamed media: ${mediaInfo.filename}`);
+    });
+    
+    // Handle client disconnect
+    req.on('close', () => {
+        console.log('Client disconnected during download');
+        if (response.data && response.data.destroy) {
+            response.data.destroy();
+        }
+    });
+    
+    // Pipe the response data to client
     response.data.pipe(res);
 
   } catch (err) {
     console.error('Error in /api/media/stream for ID', req.params.id, ':', err.message);
-    if (err.response) {
-        console.error('Axios error details:', err.response.status, err.response.data);
-        res.status(err.response.status || 502).json({ error: `Failed to fetch media from source: Status ${err.response.status}` });
-    } else if (err.request) {
-        console.error('Axios no response:', err.request);
-        res.status(504).json({ error: 'No response from media source (timeout or network issue).' });
-    }
-    else {
-        res.status(500).json({ error: 'Internal Server Error while preparing media stream.' });
+    
+    if (!res.headersSent) {
+      if (err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT') {
+          res.status(504).json({ error: 'Request timeout - media source took too long to respond.' });
+      } else if (err.response) {
+          console.error('Axios error details:', err.response.status, err.response.statusText);
+          const statusCode = err.response.status;
+          
+          if (statusCode === 403) {
+              res.status(403).json({ error: 'Access forbidden - media source blocked the request.' });
+          } else if (statusCode === 404) {
+              res.status(404).json({ error: 'Media not found at source URL.' });
+          } else if (statusCode >= 500) {
+              res.status(502).json({ error: `Media source server error: ${statusCode}` });
+          } else {
+              res.status(statusCode).json({ error: `Failed to fetch media: HTTP ${statusCode}` });
+          }
+      } else if (err.request) {
+          console.error('Axios no response received:', err.code || err.message);
+          res.status(504).json({ error: 'No response from media source (network issue or timeout).' });
+      } else {
+          console.error('Axios setup error:', err.message);
+          res.status(500).json({ error: 'Internal Server Error while preparing media stream.' });
+      }
     }
   }
+});
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ status: 'OK', timestamp: new Date().toISOString() });
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({ error: 'Internal Server Error' });
+});
+
+// Handle 404
+app.use((req, res) => {
+  res.status(404).json({ error: 'Endpoint not found' });
 });
 
 app.listen(port, () => {
