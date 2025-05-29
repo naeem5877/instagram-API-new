@@ -28,6 +28,6 @@ This repository houses an API for effortlessly downloading Instagram videos usin
    
 ## Endpoints
 
-- `/igdl?url=`
+- `/api/data?url=`
 
 **Note:** Please respect Instagram's terms of service and privacy while using this API. This tool is intended for educational and personal use only.
